@@ -8,35 +8,30 @@ from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 import uvicorn
 from dotenv import load_dotenv
 
-# Load environment variables if .env exists
+# Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
 # ---------- CONFIGURATION ----------
-# Shopify
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID")
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET")
-SHOP_DOMAIN = os.getenv("SHOP_DOMAIN") # e.g. tb57sv-zg.myshopify.com
+SHOP_DOMAIN = os.getenv("SHOP_DOMAIN")
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 
-# Meta / WhatsApp
 PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "996819796855984")
 ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "EAAWkjxOQzMYBRN17smC1dtcZCZBuBZCPMjH4GftuxLPVuj48YEZAJOS5brlIggqAzqiBUJLZBuUv1McYMkfvij07zCvgPgfLeQPYSZAMXCxxlNlp010hX1MGlyt1ShG9CqCZB0iUMCp7KxmMJhkN5CWfwwsP6SjAwmnS4ImsVsUUqeejh0HneX0iBLzgpe0TFEOOQZDZD")
 TEMPLATE_NAME = os.getenv("META_TEMPLATE_NAME", "template_book_demo")
 LANG_CODE = os.getenv("META_LANG_CODE", "en_US")
 
-# Public Host URL for auto-webhook registration
-PUBLIC_HOST_URL = os.getenv("PUBLIC_HOST_URL") # e.g. https://your-coolify-domain.com
+PUBLIC_HOST_URL = os.getenv("PUBLIC_HOST_URL")
 
-# Global cache for the token
 _cached_token = None
 
 def get_shopify_token(code: str = None):
-    """Fetch permanent access token using Client ID/Secret (Client Credentials Grant)."""
+    """Fetch permanent access token using Client ID/Secret or OAuth code."""
     global _cached_token
     
-    # If a code is provided (OAuth flow), use it to get a token
     if code:
         url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
         payload = {
@@ -46,402 +41,307 @@ def get_shopify_token(code: str = None):
         }
         resp = requests.post(url, json=payload)
         if resp.status_code == 200:
-            return resp.json().get("access_token")
+            token = resp.json().get("access_token")
+            _cached_token = token
+            return token
         return None
 
-    # Otherwise, check manual/cached token
-    if SHOPIFY_ACCESS_TOKEN and SHOPIFY_ACCESS_TOKEN != "your_token":
-        return SHOPIFY_ACCESS_TOKEN
-    
     if _cached_token:
         return _cached_token
+    
+    if SHOPIFY_ACCESS_TOKEN:
+        _cached_token = SHOPIFY_ACCESS_TOKEN
+        return _cached_token
 
-    if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
-        print("Missing SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET.")
-        return None
-
-    # Determine domain
-    domain = SHOP_DOMAIN
-    if not domain.endswith(".myshopify.com"):
-        domain = f"{domain}.myshopify.com"
-
-    url = f"https://{domain}/admin/oauth/access_token"
+    # Fetch via Client Credentials
+    url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
     payload = {
         "client_id": SHOPIFY_CLIENT_ID,
         "client_secret": SHOPIFY_CLIENT_SECRET,
         "grant_type": "client_credentials"
     }
-    
     try:
-        resp = requests.post(url, data=payload) # Use data instead of json for some Shopify variants
+        resp = requests.post(url, json=payload)
         if resp.status_code == 200:
             token = resp.json().get("access_token")
             _cached_token = token
-            print(f"Successfully fetched Shopify access token using client credentials.")
+            print("Successfully fetched Shopify access token using client credentials.")
             return token
-        else:
-            print(f"Failed to fetch Shopify token: {resp.status_code} {resp.text}")
     except Exception as e:
-        print(f"Error fetching token: {e}")
+        print(f"Error fetching Shopify token: {e}")
     
     return None
 
 @app.on_event("startup")
 async def startup_event():
-    """Attempt automatic webhook registration on startup if PUBLIC_HOST_URL is provided."""
+    """Attempt automatic webhook registration on startup."""
     token = get_shopify_token()
     if PUBLIC_HOST_URL and token:
         print(f"Server starting. Attempting auto-registration for: {PUBLIC_HOST_URL}")
-        try:
-            res = register_webhook(token, PUBLIC_HOST_URL)
-            print(f"Auto-registration result: {res}")
-        except Exception as e:
-            print(f"Failed to auto-register webhook: {e}")
+        register_webhook(token, PUBLIC_HOST_URL)
     else:
         print("Automatic webhook registration skipped (missing PUBLIC_HOST_URL or token).")
 
 # ---------- HELPERS ----------
 
 def register_webhook(token: str, address: str):
-    """Register 'orders/paid' webhook on Shopify."""
-    domain = SHOP_DOMAIN
-    if not domain.endswith(".myshopify.com"):
-        domain = f"{domain}.myshopify.com"
-    
-    url = f"https://{domain}/admin/api/2024-04/webhooks.json"
+    """Register orders/paid webhook, but only if it doesn't already exist."""
+    domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
+    base_url = f"https://{domain}/admin/api/2024-04/webhooks.json"
+    target_address = f"{address}/webhook/shopify"
     headers = {"X-Shopify-Access-Token": token}
-    payload = {
-        "webhook": {
-            "topic": "orders/paid",
-            "address": f"{address}/webhook/shopify",
-            "format": "json"
-        }
-    }
-    resp = requests.post(url, json=payload, headers=headers)
+    
+    try:
+        resp = requests.get(base_url, headers=headers)
+        if resp.status_code == 200:
+            existing = resp.json().get("webhooks", [])
+            for wh in existing:
+                if wh.get("address") == target_address and wh.get("topic") == "orders/paid":
+                    print(f"Webhook already exists at {target_address}. Skipping.")
+                    return {"message": "Webhook already exists", "webhook": wh}
+    except Exception as e:
+        print(f"Error checking existing webhooks: {e}")
+
+    payload = {"webhook": {"topic": "orders/paid", "address": target_address, "format": "json"}}
+    resp = requests.post(base_url, json=payload, headers=headers)
     return resp.json()
 
-def fetch_product_image_url(product_id: int, token: str):
-    """Fetch the first image URL for a product from Shopify."""
-    if not token:
-        return None
-    domain = SHOP_DOMAIN
-    if not domain.endswith(".myshopify.com"):
-        domain = f"{domain}.myshopify.com"
-        
-    url = f"https://{domain}/admin/api/2024-04/products/{product_id}/images.json"
+def fetch_product_image_url(product_id: int, variant_id: int, token: str):
+    """Fetch the first image URL for a product or variant from Shopify."""
+    if not token: return None
+    domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
     headers = {"X-Shopify-Access-Token": token}
-    try:
-        resp = requests.get(url, headers=headers)
-        if resp.status_code == 200:
-            images = resp.json().get("images", [])
-            if images:
-                return images[0].get("src")
-    except Exception as e:
-        print(f"Error fetching image for product {product_id}: {e}")
+    
+    if variant_id:
+        try:
+            url = f"https://{domain}/admin/api/2024-04/variants/{variant_id}.json"
+            resp = requests.get(url, headers=headers)
+            if resp.status_code == 200:
+                var = resp.json().get("variant", {})
+                img_url = var.get("image_id") or var.get("src")
+                if img_url: return img_url
+        except: pass
+
+    if product_id:
+        try:
+            url = f"https://{domain}/admin/api/2024-04/products/{product_id}/images.json"
+            resp = requests.get(url, headers=headers)
+            if resp.status_code == 200:
+                images = resp.json().get("images", [])
+                if images: return images[0].get("src")
+            elif resp.status_code == 403:
+                print("🚨 SCOPE ERROR: Needs 'read_products' permission.")
+        except Exception as e:
+            print(f"Error fetching product image: {e}")
     return None
 
 def download_image(url: str):
-    """Download an image from a URL and return as PIL Image."""
+    """Download an image and return as PIL Image."""
     try:
-        resp = requests.get(url)
+        resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             return Image.open(BytesIO(resp.content)).convert("RGBA")
-    except Exception as e:
-        print(f"Failed to download image from {url}: {e}")
+    except: pass
     return None
 
 # ---------- IMAGE GENERATION ----------
 
 def generate_pillow_image(order_data: dict, token: str):
-    # ---------- SCALE ----------
     scale = 4
+    BG, CARD, BORDER, PRIMARY, SECONDARY, ACCENT = "#f4f5f7", "#ffffff", "#e6e6e6", "#111111", "#6b7280", "#b98900"
 
-    # ---------- COLORS ----------
-    BG = "#f4f5f7"
-    CARD = "#ffffff"
-    BORDER = "#e6e6e6"
-    PRIMARY = "#111111"
-    SECONDARY = "#6b7280"
-    ACCENT = "#b98900"
-
-    # ---------- DATA EXTRACTION ----------
     order_id = order_data.get("order_number", "N/A")
     financial_status = order_data.get("financial_status", "pending").replace("_", " ").title()
-    fulfillment_status = order_data.get("fulfillment_status") or "Unfulfilled"
-    fulfillment_status = fulfillment_status.title()
-    
-    currency = order_data.get("currency", "₹")
-    if currency == "INR": currency = "₹"
+    fulfillment_status = (order_data.get("fulfillment_status") or "Unfulfilled").title()
+    currency = "₹" if order_data.get("currency") == "INR" else order_data.get("currency", "₹")
     
     line_items = order_data.get("line_items", [])
-    
-    # Process items and fetch images
     processed_items = []
-    for li in line_items:
-        product_id = li.get("product_id")
-        img_url = fetch_product_image_url(product_id, token)
-        item_img = download_image(img_url) if img_url else None
-        
+    for li in line_items[:4]: # Limit to 4 for card space
+        img_url = fetch_product_image_url(li.get("product_id"), li.get("variant_id"), token)
         processed_items.append({
             "name": li.get("title", "Product"),
             "subtitle": li.get("variant_title", ""),
             "price": float(li.get("price", 0)),
             "qty": int(li.get("quantity", 1)),
-            "image": item_img
+            "image": download_image(img_url) if img_url else None
         })
 
     subtotal = float(order_data.get("current_subtotal_price", 0))
+    total_discounts = float(order_data.get("total_discounts", 0))
+    shipping_set = order_data.get("total_shipping_price_set", {}) or {}
+    shipping = float(shipping_set.get("shop_money", {}).get("amount", 0))
+    total_tax = float(order_data.get("total_tax", 0))
     total_price = float(order_data.get("current_total_price", 0))
     paid = total_price - float(order_data.get("total_outstanding", total_price))
 
-    # ---------- IMAGE SETUP ----------
     W, H = 800 * scale, 1400 * scale
     img = Image.new("RGB", (W, H), BG)
     draw = ImageDraw.Draw(img)
 
-    # ---------- FONTS ----------
     def font(size, bold=False):
         try:
-            paths = [
-                "/System/Library/Fonts/SFNS.ttf",
-                "/System/Library/Fonts/Helvetica.ttc",
-                "/Library/Fonts/Arial.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
-            ]
-            for p in paths:
-                if os.path.exists(p):
-                    return ImageFont.truetype(p, size)
+            for p in ["/System/Library/Fonts/SFNS.ttf", "/Library/Fonts/Arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
+                if os.path.exists(p): return ImageFont.truetype(p, size)
             return ImageFont.load_default()
-        except:
-            return ImageFont.load_default()
+        except: return ImageFont.load_default()
 
-    title_font = font(24 * scale, True)
-    bold_font = font(18 * scale, True)
-    small_font = font(14 * scale)
+    title_font, bold_font, small_font = font(24*scale, True), font(18*scale, True), font(14*scale)
 
-    # ---------- HELPERS ----------
     def shadow_card(x, y, w, h, r=20):
         shadow = Image.new("RGBA", (w, h), (0,0,0,0))
-        sdraw = ImageDraw.Draw(shadow)
-        sdraw.rounded_rectangle((0,0,w,h), r, fill=(0,0,0,40))
-        shadow = shadow.filter(ImageFilter.GaussianBlur(10))
-        img.paste(shadow, (x+5, y+5), shadow)
-        draw.rounded_rectangle((x, y, x+w, y+h), r, fill=CARD, outline=BORDER)
+        ImageDraw.Draw(shadow).rounded_rectangle((0,0,w,h), r, fill=(0,0,0,40))
+        img.paste(shadow.filter(ImageFilter.GaussianBlur(10)), (x+5, y+5), shadow.filter(ImageFilter.GaussianBlur(10)))
 
     def text(x, y, t, f=small_font, fill=PRIMARY):
         draw.text((x, y), str(t), font=f, fill=fill)
 
-    # ---------- HEADER ----------
     pad = 24 * scale
     text(pad, pad, f"#{order_id}", bold_font)
     text(pad + 140*scale, pad, financial_status, small_font, ACCENT)
     text(pad + 360*scale, pad, fulfillment_status, small_font, ACCENT)
 
-    # ---------- CARD 1 (ITEMS) ----------
     card_w = W - (pad * 2)
-    item_h = 100 * scale
-    card_h = len(processed_items) * item_h + 100 * scale
-
+    card_h = len(processed_items) * 100 * scale + 100 * scale
     card_y = 80 * scale
     shadow_card(pad, card_y, card_w, card_h)
-
-    text(pad + pad, card_y + pad, f"Items ({len(processed_items)})", bold_font, ACCENT)
+    text(pad + pad, card_y + pad, f"Items ({len(line_items)})", bold_font, ACCENT)
 
     y = card_y + 80 * scale
-
     for item in processed_items:
         img_size = 70 * scale
-
         if item["image"]:
-            try:
-                item_img = item["image"].resize((img_size, img_size))
-                mask = Image.new("L", (img_size, img_size), 0)
-                ImageDraw.Draw(mask).rounded_rectangle((0, 0, img_size, img_size), 12, fill=255)
-                img.paste(item_img, (pad + pad, y), mask)
-                draw.rounded_rectangle((pad + pad, y, pad + pad + img_size, y + img_size), 12, outline=BORDER)
-            except Exception as e:
-                print(f"Failed to paste image: {e}")
-                draw.rounded_rectangle((pad + pad, y, pad + pad + img_size, y + img_size), 12, fill="#f0f0f0")
+            item_img = item["image"].resize((img_size, img_size))
+            mask = Image.new("L", (img_size, img_size), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, img_size, img_size), 12, fill=255)
+            img.paste(item_img, (pad + pad, y), mask)
+            draw.rounded_rectangle((pad + pad, y, pad + pad + img_size, y + img_size), 12, outline=BORDER)
         else:
             draw.rounded_rectangle((pad + pad, y, pad + pad + img_size, y + img_size), 12, fill="#f0f0f0")
-
-        # text
         tx = pad + pad + img_size + 20 * scale
         text(tx, y, item["name"][:35] + ("..." if len(item["name"]) > 35 else ""), bold_font)
-
-        if item["subtitle"]:
-            text(tx, y + 28*scale, item["subtitle"], small_font, SECONDARY)
-
-        # right price
+        if item["subtitle"]: text(tx, y + 28*scale, item["subtitle"], small_font, SECONDARY)
         rx = pad + card_w - pad
-        price_str = f"{currency}{item['price']:.2f} x {item['qty']}"
-        total_str = f"{currency}{(item['price'] * item['qty']):.2f}"
+        draw.text((rx - 280*scale, y), f"{currency}{item['price']:.2f} x {item['qty']}", font=small_font, fill=SECONDARY)
+        draw.text((rx - 60*scale, y), f"{currency}{(item['price'] * item['qty']):.2f}", font=bold_font, fill=PRIMARY)
+        y += 100 * scale
 
-        draw.text((rx - 280*scale, y), price_str, font=small_font, fill=SECONDARY)
-        draw.text((rx - 60*scale, y), total_str, font=bold_font, fill=PRIMARY)
-
-        y += item_h
-
-    # ---------- CARD 2 (SUMMARY) ----------
     card2_y = card_y + card_h + 30 * scale
-    card2_h = 350 * scale
-    shadow_card(pad, card2_y, card_w, card2_h)
-
+    shadow_card(pad, card2_y, card_w, 350 * scale)
     text(pad + pad, card2_y + pad, financial_status, bold_font, ACCENT)
     text(pad + pad, card2_y + 70 * scale, "Thank you for your order!", small_font, SECONDARY)
 
-    # ---------- TOTALS ----------
-    t_y = card2_y + 140 * scale
-
-    def total_row(label, value, curr_y, is_bold=False):
+    y_cursor = card2_y + 110 * scale
+    def total_row(label, value, curr_y, is_bold=False, color=PRIMARY):
         f = bold_font if is_bold else small_font
         text(pad + pad, curr_y, label, f, PRIMARY)
-        val_str = f"{currency}{value:.2f}"
-        draw.text((pad + card_w - 100*scale, curr_y), val_str, font=f, fill=PRIMARY)
+        val_str = f"{currency}{abs(value):.2f}"
+        if label == "Discount": val_str = f"- {val_str}"
+        draw.text((pad + card_w - pad - 120*scale, curr_y), val_str, font=f, fill=color)
+        return curr_y + 40 * scale
 
-    total_row("Subtotal", subtotal, t_y)
-    total_row("Total", total_price, t_y + 50*scale, True)
-    total_row("Paid", paid, t_y + 100*scale)
-    total_row("Balance", total_price - paid, t_y + 150*scale, True)
+    y_cursor = total_row("Subtotal", subtotal, y_cursor)
+    if total_discounts > 0: y_cursor = total_row("Discount", total_discounts, y_cursor, color="#d91e18")
+    if shipping > 0: y_cursor = total_row("Shipping", shipping, y_cursor)
+    if total_tax > 0: y_cursor = total_row("Tax", total_tax, y_cursor)
+    y_cursor += 10 * scale
+    draw.line((pad+pad, y_cursor, pad+card_w-pad, y_cursor), fill=BORDER, width=2)
+    y_cursor += 20 * scale
+    y_cursor = total_row("Total", total_price, y_cursor, is_bold=True)
+    y_cursor = total_row("Paid", paid, y_cursor)
+    total_row("Balance", max(0, total_price - paid), y_cursor, is_bold=True, color=ACCENT)
 
-    # ---------- SAVE ----------
     out_name = f"order_{order_id}_{uuid.uuid4().hex[:8]}.png"
     out_path = os.path.join(os.path.dirname(__file__), out_name)
     img.save(out_path, dpi=(300, 300))
-    print(f"Saved generated image to {out_path}")
     return out_path
 
-# ---------- META INTEGRATION ----------
+# ---------- META ----------
 
 def upload_media(file_path: str):
-    media_url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/media"
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    mime_type = "image/png"
-    with open(file_path, "rb") as f:
-        files = {"file": (os.path.basename(file_path), f, mime_type)}
-        data = {"type": "image", "messaging_product": "whatsapp"}
-        resp = requests.post(media_url, headers=headers, files=files, data=data)
-    
-    if resp.status_code != 200:
-        print("Media upload failed:", resp.text)
-        return None
-    return resp.json().get("id")
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "image/png"), "type": (None, "image/png"), "messaging_product": (None, "whatsapp")}
+            resp = requests.post(url, headers=headers, files=files)
+            if resp.status_code == 200: return resp.json().get("id")
+    except: pass
+    return None
 
-def send_whatsapp_template(to: str, media_id: str, body_params: list = None):
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+def send_whatsapp_template(to: str, media_id: str):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "template",
+        "messaging_product": "whatsapp", "to": to, "type": "template",
         "template": {
-            "name": TEMPLATE_NAME,
-            "language": {"code": LANG_CODE},
-            "components": [
-                {
-                    "type": "header",
-                    "parameters": [{"type": "image", "image": {"id": media_id}}]
-                }
-            ]
+            "name": TEMPLATE_NAME, "language": {"code": LANG_CODE},
+            "components": [{"type": "header", "parameters": [{"type": "image", "image": {"id": media_id}}]}]
         }
     }
-    if body_params:
-        payload["template"]["components"].append({
-            "type": "body",
-            "parameters": [{"type": "text", "text": p} for p in body_params]
-        })
-    
-    resp = requests.post(url, headers=headers, json=payload)
-    return resp.json()
+    return requests.post(url, headers=headers, json=payload).json()
 
-# ---------- CORE LOGIC ----------
+# ---------- BACKGROUND TASK ----------
 
 async def handle_order_webhook(order_data: dict):
-    """Background task to process order, generate image, and send WhatsApp."""
     try:
         token = get_shopify_token()
-        if not token:
-            print("Aborting background tasks because token could not be fetched.")
-            return
-
-        # 1. Generate Image
+        if not token: return
         local_path = generate_pillow_image(order_data, token)
-        
-        # 2. Upload to Meta
         media_id = upload_media(local_path)
-        
         if media_id:
-            # 3. Send WhatsApp
-            customer = order_data.get("customer", {})
+            customer = order_data.get("customer") or {}
             phone = customer.get("phone") or customer.get("default_address", {}).get("phone")
-            
             if phone:
                 clean_phone = "".join(filter(str.isdigit, phone))
                 if len(clean_phone) == 10: clean_phone = "91" + clean_phone
-                
-                res = send_whatsapp_template(clean_phone, media_id)
-                print(f"WhatsApp sent to {clean_phone}: {res}")
-            else:
-                print("No customer phone number found.")
-        
-        # Cleanup
-        if os.path.exists(local_path):
-            os.remove(local_path)
-            
-    except Exception as e:
-        print(f"Error in handle_order_webhook: {e}")
+                send_whatsapp_template(clean_phone, media_id)
+        if os.path.exists(local_path): os.remove(local_path)
+    except Exception as e: print(f"Error in handle_order_webhook: {e}")
 
 # ---------- ENDPOINTS ----------
 
 @app.post("/webhook/shopify")
 async def shopify_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Shopify webhook receiver."""
     data = await request.json()
-    print(f"Received Shopify webhook for order: {data.get('order_number')}")
     background_tasks.add_task(handle_order_webhook, data)
     return {"status": "received"}
 
 @app.get("/setup")
 async def setup(request: Request, code: str = None, host_url: str = None):
-    """Helper to get token or register webhook."""
-    # 1. Handle OAuth code exchange if provided
-    if code:
+    if code: 
         token = get_shopify_token(code=code)
         return {"access_token": token}
-    
-    # 2. Auto-fetch token using Client ID/Secret if no code
     token = get_shopify_token()
-    if not token:
-        return {"error": "Could not fetch or find SHOPIFY_ACCESS_TOKEN. Check Client ID and Secret."}
-    
-    # 3. Auto-detect host URL if not provided
+    if not token: return {"error": "No token."}
     if not host_url:
-        proto = request.headers.get("x-forwarded-proto", "http")
-        host = request.headers.get("host")
-        if host:
-            host_url = f"{proto}://{host}"
-    
+        proto, host = request.headers.get("x-forwarded-proto", "http"), request.headers.get("host")
+        if host: host_url = f"{proto}://{host}"
     if host_url:
-        print(f"Attempting to register webhook for {host_url}")
-        res = register_webhook(token, host_url)
-        return {
-            "message": f"Registering webhook at {host_url}/webhook/shopify",
-            "webhook_registration": res,
-            "token_used": f"{token[:10]}..."
-        }
-    
-    return {"message": "Ensure PUBLIC_HOST_URL is set in .env or provide host_url parameter."}
+        register_webhook(token, host_url)
+        return {"message": f"Setup complete for {host_url}"}
+    return {"error": "Missing host_url"}
+
+@app.get("/cleanup")
+async def cleanup():
+    token = get_shopify_token()
+    if not token: return {"error": "No token."}
+    domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
+    url = f"https://{domain}/admin/api/2024-04/webhooks.json"
+    headers = {"X-Shopify-Access-Token": token}
+    deleted = []
+    try:
+        resp = requests.get(url, headers=headers)
+        for wh in resp.json().get("webhooks", []):
+            wh_id = wh.get("id")
+            del_resp = requests.delete(f"https://{domain}/admin/api/2024-04/webhooks/{wh_id}.json", headers=headers)
+            deleted.append({"id": wh_id, "status": del_resp.status_code})
+    except: pass
+    return {"message": "Cleanup complete", "deleted_count": len(deleted)}
 
 @app.get("/")
 def health():
-    token = get_shopify_token()
-    return {
-        "status": "running", 
-        "message": "Shopify-Meta Webhook Server is live.",
-        "token_available": token is not None
-    }
+    return {"status": "running", "token": get_shopify_token() is not None}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5002)
