@@ -56,14 +56,14 @@ def get_shopify_token(force_refresh=False):
         _cached_token = SHOPIFY_ACCESS_TOKEN
         return _cached_token
 
-    log("Fetching fresh Shopify token via Client Credentials...")
+    log("Fetching fresh Shopify token...")
     url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
     payload = {"client_id": SHOPIFY_CLIENT_ID, "client_secret": SHOPIFY_CLIENT_SECRET, "grant_type": "client_credentials"}
     try:
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code == 200:
             token = resp.json().get("access_token")
-            log("Successfully obtained new Shopify token.")
+            log("Obtained new Shopify token.")
             _cached_token = token
             return token
         else:
@@ -101,8 +101,7 @@ def fetch_product_image_url(product_id: int, variant_id: int):
         url = f"https://{domain}/admin/api/2024-04/variants/{variant_id}.json"
         resp = shopify_request(url, headers)
         if resp and resp.status_code == 200:
-            v = resp.json().get("variant", {})
-            img = v.get("image_id") or v.get("src")
+            v = resp.json().get("variant", {})\n            img = v.get("image_id") or v.get("src")
             if img: return img
 
     if product_id:
@@ -112,7 +111,7 @@ def fetch_product_image_url(product_id: int, variant_id: int):
             imgs = resp.json().get("images", [])
             if imgs: return imgs[0].get("src")
         elif resp and resp.status_code == 403:
-            log("🚨 403 FORBIDDEN: Please enable 'read_products' scope.")
+            log("🚨 403 FORBIDDEN: App needs 'read_products' scope.")
     return None
 
 def download_image(url: str):
@@ -243,7 +242,6 @@ async def process_order(data):
     order_id = data.get("id")
     if order_id in _processed_orders: return
     _processed_orders.add(order_id)
-    
     try:
         path = generate_pillow_image(data)
         mid = upload_media(path)
@@ -259,7 +257,7 @@ async def process_order(data):
 
 # ---------- ENDPOINTS ----------
 
-@app.post("/webhook/shopify")
+@app.post("/webhook/orders")
 async def webhook(request: Request, background_tasks: BackgroundTasks, x_shopify_hmac_sha256: str = Header(None)):
     body = await request.body()
     log("🔥 WEBHOOK RECEIVED")
@@ -277,17 +275,21 @@ async def setup(request: Request):
     host = PUBLIC_HOST_URL or f"{request.headers.get('x-forwarded-proto', 'http')}://{request.headers.get('host')}"
     domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
     
-    # Clean previous
     url = f"https://{domain}/admin/api/2024-04/webhooks.json"
-    r = shopify_request(url, {"X-Shopify-Access-Token": token})
-    for wh in r.json().get("webhooks", []):
-        shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", {"X-Shopify-Access-Token": token}, method="DELETE")
+    headers = {"X-Shopify-Access-Token": token}
+    
+    # Aggressive Cleanup
+    try:
+        r = shopify_request(url, headers)
+        for wh in r.json().get("webhooks", []):
+            shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", headers, method="DELETE")
+    except: pass
     
     results = []
-    target = f"{host}/webhook/shopify"
+    target = f"{host}/webhook/orders"
     for topic in ["orders/create", "orders/paid"]:
         payload = {"webhook": {"topic": topic, "address": target, "format": "json"}}
-        resp = shopify_request(url, {"X-Shopify-Access-Token": token}, method="POST", json=payload)
+        resp = shopify_request(url, headers, method="POST", json=payload)
         results.append({topic: resp.status_code})
     
     return {"message": f"Setup for {host}", "details": results}
@@ -297,11 +299,14 @@ async def cleanup():
     token = get_shopify_token()
     domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
     url = f"https://{domain}/admin/api/2024-04/webhooks.json"
-    r = shopify_request(url, {"X-Shopify-Access-Token": token})
+    headers = {"X-Shopify-Access-Token": token}
     count = 0
-    for wh in r.json().get("webhooks", []):
-        shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", {"X-Shopify-Access-Token": token}, method="DELETE")
-        count += 1
+    try:
+        r = shopify_request(url, headers)
+        for wh in r.json().get("webhooks", []):
+            shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", headers, method="DELETE")
+            count += 1
+    except: pass
     return {"message": "Cleanup complete", "deleted_count": count}
 
 @app.get("/")
