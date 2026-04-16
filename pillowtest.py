@@ -26,24 +26,89 @@ ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "EAAWkjxOQzMYBRN17smC1dtcZCZBuBZCP
 TEMPLATE_NAME = os.getenv("META_TEMPLATE_NAME", "template_book_demo")
 LANG_CODE = os.getenv("META_LANG_CODE", "en_US")
 
-# ---------- HELPERS ----------
+# Public Host URL for auto-webhook registration
+PUBLIC_HOST_URL = os.getenv("PUBLIC_HOST_URL") # e.g. https://your-coolify-domain.com
 
-def get_shopify_token(code: str):
-    """Exchange auth code for permanent access token."""
-    url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
+# Global cache for the token
+_cached_token = None
+
+def get_shopify_token(code: str = None):
+    """Fetch permanent access token using Client ID/Secret (Client Credentials Grant)."""
+    global _cached_token
+    
+    # If a code is provided (OAuth flow), use it to get a token
+    if code:
+        url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
+        payload = {
+            "client_id": SHOPIFY_CLIENT_ID,
+            "client_secret": SHOPIFY_CLIENT_SECRET,
+            "code": code
+        }
+        resp = requests.post(url, json=payload)
+        if resp.status_code == 200:
+            return resp.json().get("access_token")
+        return None
+
+    # Otherwise, check manual/cached token
+    if SHOPIFY_ACCESS_TOKEN and SHOPIFY_ACCESS_TOKEN != "your_token":
+        return SHOPIFY_ACCESS_TOKEN
+    
+    if _cached_token:
+        return _cached_token
+
+    if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+        print("Missing SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET.")
+        return None
+
+    # Determine domain
+    domain = SHOP_DOMAIN
+    if not domain.endswith(".myshopify.com"):
+        domain = f"{domain}.myshopify.com"
+
+    url = f"https://{domain}/admin/oauth/access_token"
     payload = {
         "client_id": SHOPIFY_CLIENT_ID,
         "client_secret": SHOPIFY_CLIENT_SECRET,
-        "code": code
+        "grant_type": "client_credentials"
     }
-    resp = requests.post(url, json=payload)
-    if resp.status_code == 200:
-        return resp.json().get("access_token")
+    
+    try:
+        resp = requests.post(url, data=payload) # Use data instead of json for some Shopify variants
+        if resp.status_code == 200:
+            token = resp.json().get("access_token")
+            _cached_token = token
+            print(f"Successfully fetched Shopify access token using client credentials.")
+            return token
+        else:
+            print(f"Failed to fetch Shopify token: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"Error fetching token: {e}")
+    
     return None
+
+@app.on_event("startup")
+async def startup_event():
+    """Attempt automatic webhook registration on startup if PUBLIC_HOST_URL is provided."""
+    token = get_shopify_token()
+    if PUBLIC_HOST_URL and token:
+        print(f"Server starting. Attempting auto-registration for: {PUBLIC_HOST_URL}")
+        try:
+            res = register_webhook(token, PUBLIC_HOST_URL)
+            print(f"Auto-registration result: {res}")
+        except Exception as e:
+            print(f"Failed to auto-register webhook: {e}")
+    else:
+        print("Automatic webhook registration skipped (missing PUBLIC_HOST_URL or token).")
+
+# ---------- HELPERS ----------
 
 def register_webhook(token: str, address: str):
     """Register 'orders/paid' webhook on Shopify."""
-    url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/webhooks.json"
+    domain = SHOP_DOMAIN
+    if not domain.endswith(".myshopify.com"):
+        domain = f"{domain}.myshopify.com"
+    
+    url = f"https://{domain}/admin/api/2024-04/webhooks.json"
     headers = {"X-Shopify-Access-Token": token}
     payload = {
         "webhook": {
@@ -59,7 +124,11 @@ def fetch_product_image_url(product_id: int, token: str):
     """Fetch the first image URL for a product from Shopify."""
     if not token:
         return None
-    url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/products/{product_id}/images.json"
+    domain = SHOP_DOMAIN
+    if not domain.endswith(".myshopify.com"):
+        domain = f"{domain}.myshopify.com"
+        
+    url = f"https://{domain}/admin/api/2024-04/products/{product_id}/images.json"
     headers = {"X-Shopify-Access-Token": token}
     try:
         resp = requests.get(url, headers=headers)
@@ -123,8 +192,6 @@ def generate_pillow_image(order_data: dict, token: str):
 
     subtotal = float(order_data.get("current_subtotal_price", 0))
     total_price = float(order_data.get("current_total_price", 0))
-    total_paid = float(order_data.get("total_outstanding", 0)) # Wait, outstanding is balance. 
-    # Let's use total_price - total_outstanding for paid.
     paid = total_price - float(order_data.get("total_outstanding", total_price))
 
     # ---------- IMAGE SETUP ----------
@@ -135,7 +202,6 @@ def generate_pillow_image(order_data: dict, token: str):
     # ---------- FONTS ----------
     def font(size, bold=False):
         try:
-            # Common paths for Mac
             paths = [
                 "/System/Library/Fonts/SFNS.ttf",
                 "/System/Library/Fonts/Helvetica.ttc",
@@ -295,7 +361,11 @@ def send_whatsapp_template(to: str, media_id: str, body_params: list = None):
 async def handle_order_webhook(order_data: dict):
     """Background task to process order, generate image, and send WhatsApp."""
     try:
-        token = SHOPIFY_ACCESS_TOKEN
+        token = get_shopify_token()
+        if not token:
+            print("Aborting background tasks because token could not be fetched.")
+            return
+
         # 1. Generate Image
         local_path = generate_pillow_image(order_data, token)
         
@@ -304,14 +374,11 @@ async def handle_order_webhook(order_data: dict):
         
         if media_id:
             # 3. Send WhatsApp
-            # Extract customer phone
             customer = order_data.get("customer", {})
             phone = customer.get("phone") or customer.get("default_address", {}).get("phone")
             
-            # Clean phone number (remove +, spaces, etc. - simple version)
             if phone:
                 clean_phone = "".join(filter(str.isdigit, phone))
-                # Ensure it has country code (simple default to 91 if 10 digits)
                 if len(clean_phone) == 10: clean_phone = "91" + clean_phone
                 
                 res = send_whatsapp_template(clean_phone, media_id)
@@ -331,44 +398,50 @@ async def handle_order_webhook(order_data: dict):
 @app.post("/webhook/shopify")
 async def shopify_webhook(request: Request, background_tasks: BackgroundTasks):
     """Shopify webhook receiver."""
-    # Verify HMAC here in production
     data = await request.json()
     print(f"Received Shopify webhook for order: {data.get('order_number')}")
-    
-    # Process in background to return 200 early
     background_tasks.add_task(handle_order_webhook, data)
-    
     return {"status": "received"}
 
 @app.get("/setup")
 async def setup(request: Request, code: str = None, host_url: str = None):
     """Helper to get token or register webhook."""
+    # 1. Handle OAuth code exchange if provided
     if code:
-        token = get_shopify_token(code)
+        token = get_shopify_token(code=code)
         return {"access_token": token}
     
-    # If host_url not provided, try to detect it from request headers
+    # 2. Auto-fetch token using Client ID/Secret if no code
+    token = get_shopify_token()
+    if not token:
+        return {"error": "Could not fetch or find SHOPIFY_ACCESS_TOKEN. Check Client ID and Secret."}
+    
+    # 3. Auto-detect host URL if not provided
     if not host_url:
-        # Check X-Forwarded-Proto for https (important for ngrok)
         proto = request.headers.get("x-forwarded-proto", "http")
         host = request.headers.get("host")
         if host:
             host_url = f"{proto}://{host}"
     
-    if host_url and SHOPIFY_ACCESS_TOKEN:
+    if host_url:
         print(f"Attempting to register webhook for {host_url}")
-        res = register_webhook(SHOPIFY_ACCESS_TOKEN, host_url)
+        res = register_webhook(token, host_url)
         return {
             "message": f"Registering webhook at {host_url}/webhook/shopify",
-            "webhook_registration": res
+            "webhook_registration": res,
+            "token_used": f"{token[:10]}..."
         }
     
-    return {"message": "Provide 'code' to get token or ensure SHOPIFY_ACCESS_TOKEN is set in .env."}
+    return {"message": "Ensure PUBLIC_HOST_URL is set in .env or provide host_url parameter."}
 
 @app.get("/")
 def health():
-    return {"status": "running", "message": "Shopify-Meta Webhook Server is live."}
+    token = get_shopify_token()
+    return {
+        "status": "running", 
+        "message": "Shopify-Meta Webhook Server is live.",
+        "token_available": token is not None
+    }
 
 if __name__ == "__main__":
-    # To run locally: uvicorn pillowtest:app --reload --port 5002
     uvicorn.run(app, host="0.0.0.0", port=5002)
