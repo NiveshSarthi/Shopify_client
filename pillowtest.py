@@ -50,26 +50,22 @@ def verify_shopify_hmac(data: bytes, hmac_header: str):
 
 def get_shopify_token(force_refresh=False):
     global _cached_token
-    if _cached_token and not force_refresh:
-        return _cached_token
+    if _cached_token and not force_refresh: return _cached_token
     if SHOPIFY_ACCESS_TOKEN and not force_refresh:
         _cached_token = SHOPIFY_ACCESS_TOKEN
         return _cached_token
 
-    log("Fetching fresh Shopify token...")
+    log("Refreshing Shopify token...")
     url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
     payload = {"client_id": SHOPIFY_CLIENT_ID, "client_secret": SHOPIFY_CLIENT_SECRET, "grant_type": "client_credentials"}
     try:
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code == 200:
             token = resp.json().get("access_token")
-            log("Obtained new Shopify token.")
             _cached_token = token
+            log("Token refreshed successfully.")
             return token
-        else:
-            log(f"Token Fetch Failed: {resp.status_code} {resp.text}")
-    except Exception as e:
-        log(f"Token fetch error: {e}")
+    except: pass
     return _cached_token
 
 def shopify_request(url, headers, method="GET", json=None):
@@ -79,7 +75,7 @@ def shopify_request(url, headers, method="GET", json=None):
         else: resp = requests.post(url, headers=headers, json=json, timeout=10)
             
         if resp.status_code == 401:
-            log("Shopify Token 401 detected. Refreshing...")
+            log("401 detected, refreshing token...")
             new_token = get_shopify_token(force_refresh=True)
             if new_token:
                 headers["X-Shopify-Access-Token"] = new_token
@@ -87,13 +83,10 @@ def shopify_request(url, headers, method="GET", json=None):
                 if method == "DELETE": return requests.delete(url, headers=headers, timeout=10)
                 return requests.post(url, headers=headers, json=json, timeout=10)
         return resp
-    except Exception as e:
-        log(f"Request Error: {e}")
-        return None
+    except: return None
 
-def fetch_product_image_url(product_id: int, variant_id: int):
+def fetch_product_image_url(product_id, variant_id):
     token = get_shopify_token()
-    if not token: return None
     domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
     headers = {"X-Shopify-Access-Token": token}
     
@@ -111,11 +104,9 @@ def fetch_product_image_url(product_id: int, variant_id: int):
         if resp and resp.status_code == 200:
             imgs = resp.json().get("images", [])
             if imgs: return imgs[0].get("src")
-        elif resp and resp.status_code == 403:
-            log("🚨 403 FORBIDDEN: App needs 'read_products' scope.")
     return None
 
-def download_image(url: str):
+def download_image(url):
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
@@ -123,20 +114,16 @@ def download_image(url: str):
     except: pass
     return None
 
-# ---------- IMAGE GENERATION ----------
-
-def generate_pillow_image(order_data: dict):
+def generate_pillow_image(order_data):
     scale = 4
     BG, CARD, BORDER, PRIMARY, SECONDARY, ACCENT = "#F8F9FA", "#FFFFFF", "#E9ECEF", "#212529", "#6C757D", "#CC8E00"
-
+    
     order_id = order_data.get("order_number", "N/A")
     financial_status = order_data.get("financial_status", "Paid").replace("_", " ").title()
     currency = "₹" if order_data.get("currency") == "INR" else order_data.get("currency", "₹")
     
     items = order_data.get("line_items", [])
     processed_items = []
-    log(f"Processing order #{order_id}...")
-    
     for li in items[:4]:
         img_url = fetch_product_image_url(li.get("product_id"), li.get("variant_id"))
         processed_items.append({
@@ -148,8 +135,7 @@ def generate_pillow_image(order_data: dict):
 
     subtotal = float(order_data.get("current_subtotal_price", 0))
     discount = float(order_data.get("total_discounts", 0))
-    shipping_set = order_data.get("total_shipping_price_set", {}) or {}
-    shipping = float(shipping_set.get("shop_money", {}).get("amount", 0))
+    shipping = float((order_data.get("total_shipping_price_set", {}) or {}).get("shop_money", {}).get("amount", 0))
     tax = float(order_data.get("total_tax", 0))
     total = float(order_data.get("current_total_price", 0))
     paid = total - float(order_data.get("total_outstanding", 0))
@@ -222,8 +208,6 @@ def generate_pillow_image(order_data: dict):
     img.save(out, dpi=(300, 300))
     return out
 
-# ---------- ACTIONS ----------
-
 def upload_media(path):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
@@ -254,9 +238,7 @@ async def process_order(data):
                 if len(p) == 10: p = "91" + p
                 send_whatsapp(p, mid)
         if os.path.exists(path): os.remove(path)
-    except Exception as e: log(f"Process Error: {e}")
-
-# ---------- ENDPOINTS ----------
+    except: pass
 
 @app.post("/webhook/orders")
 async def webhook(request: Request, background_tasks: BackgroundTasks, x_shopify_hmac_sha256: str = Header(None)):
@@ -275,24 +257,27 @@ async def setup(request: Request):
     token = get_shopify_token()
     host = PUBLIC_HOST_URL or f"{request.headers.get('x-forwarded-proto', 'http')}://{request.headers.get('host')}"
     domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
-    
     url = f"https://{domain}/admin/api/2024-04/webhooks.json"
     headers = {"X-Shopify-Access-Token": token}
     
-    # Aggressive Cleanup
+    # 1. Vigorous Cleanup
     try:
         r = shopify_request(url, headers)
-        for wh in r.json().get("webhooks", []):
-            shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", headers, method="DELETE")
+        if r and r.status_code == 200:
+            for wh in r.json().get("webhooks", []):
+                shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", headers, method="DELETE")
     except: pass
     
+    # 2. Re-register
     results = []
     target = f"{host}/webhook/orders"
     for topic in ["orders/create", "orders/paid"]:
         payload = {"webhook": {"topic": topic, "address": target, "format": "json"}}
         resp = shopify_request(url, headers, method="POST", json=payload)
-        results.append({topic: resp.status_code})
-    
+        status = resp.status_code if resp else "Failed"
+        error = resp.text if resp and resp.status_code >= 400 else None
+        results.append({"topic": topic, "status": status, "error": error})
+        
     return {"message": f"Setup for {host}", "details": results}
 
 @app.get("/cleanup")
@@ -300,14 +285,12 @@ async def cleanup():
     token = get_shopify_token()
     domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
     url = f"https://{domain}/admin/api/2024-04/webhooks.json"
-    headers = {"X-Shopify-Access-Token": token}
+    r = shopify_request(url, {"X-Shopify-Access-Token": token})
     count = 0
-    try:
-        r = shopify_request(url, headers)
+    if r and r.status_code == 200:
         for wh in r.json().get("webhooks", []):
-            shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", headers, method="DELETE")
+            shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", {"X-Shopify-Access-Token": token}, method="DELETE")
             count += 1
-    except: pass
     return {"message": "Cleanup complete", "deleted_count": count}
 
 @app.get("/")
