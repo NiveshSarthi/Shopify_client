@@ -101,7 +101,8 @@ def fetch_product_image_url(product_id: int, variant_id: int):
         url = f"https://{domain}/admin/api/2024-04/variants/{variant_id}.json"
         resp = shopify_request(url, headers)
         if resp and resp.status_code == 200:
-            v = resp.json().get("variant", {})\n            img = v.get("image_id") or v.get("src")
+            v = resp.json().get("variant", {})
+            img = v.get("image_id") or v.get("src")
             if img: return img
 
     if product_id:
