@@ -49,26 +49,16 @@ def verify_shopify_hmac(data: bytes, hmac_header: str):
 # ---------- CORE LOGIC ----------
 
 def get_shopify_token(force_refresh=False):
-    """Fetch or refresh the Shopify access token."""
     global _cached_token
-    
-    # Return cache if available and not forcing refresh
     if _cached_token and not force_refresh:
         return _cached_token
-        
-    # Check .env but only if not forcing refresh
     if SHOPIFY_ACCESS_TOKEN and not force_refresh:
         _cached_token = SHOPIFY_ACCESS_TOKEN
         return _cached_token
 
-    # Fetch fresh token via Client Credentials
     log("Fetching fresh Shopify token via Client Credentials...")
     url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
-    payload = {
-        "client_id": SHOPIFY_CLIENT_ID,
-        "client_secret": SHOPIFY_CLIENT_SECRET,
-        "grant_type": "client_credentials"
-    }
+    payload = {"client_id": SHOPIFY_CLIENT_ID, "client_secret": SHOPIFY_CLIENT_SECRET, "grant_type": "client_credentials"}
     try:
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code == 200:
@@ -80,22 +70,16 @@ def get_shopify_token(force_refresh=False):
             log(f"Token Fetch Failed: {resp.status_code} {resp.text}")
     except Exception as e:
         log(f"Token fetch error: {e}")
-    
-    return _cached_token # Fallback to last known if refresh fails
+    return _cached_token
 
 def shopify_request(url, headers, method="GET", json=None):
-    """Wrapper for Shopify API calls with auto-token-refresh on 401."""
     try:
-        if method == "GET":
-            resp = requests.get(url, headers=headers, timeout=10)
-        elif method == "DELETE":
-            resp = requests.delete(url, headers=headers, timeout=10)
-        else:
-            resp = requests.post(url, headers=headers, json=json, timeout=10)
+        if method == "GET": resp = requests.get(url, headers=headers, timeout=10)
+        elif method == "DELETE": resp = requests.delete(url, headers=headers, timeout=10)
+        else: resp = requests.post(url, headers=headers, json=json, timeout=10)
             
-        # Detect token expiration/invalidity
         if resp.status_code == 401:
-            log("Shopify Token 401 detected. Refreshing and retrying...")
+            log("Shopify Token 401 detected. Refreshing...")
             new_token = get_shopify_token(force_refresh=True)
             if new_token:
                 headers["X-Shopify-Access-Token"] = new_token
@@ -113,7 +97,6 @@ def fetch_product_image_url(product_id: int, variant_id: int):
     domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
     headers = {"X-Shopify-Access-Token": token}
     
-    # 1. Try Variant API
     if variant_id:
         url = f"https://{domain}/admin/api/2024-04/variants/{variant_id}.json"
         resp = shopify_request(url, headers)
@@ -122,7 +105,6 @@ def fetch_product_image_url(product_id: int, variant_id: int):
             img = v.get("image_id") or v.get("src")
             if img: return img
 
-    # 2. Try Product API
     if product_id:
         url = f"https://{domain}/admin/api/2024-04/products/{product_id}/images.json"
         resp = shopify_request(url, headers)
@@ -131,7 +113,6 @@ def fetch_product_image_url(product_id: int, variant_id: int):
             if imgs: return imgs[0].get("src")
         elif resp and resp.status_code == 403:
             log("🚨 403 FORBIDDEN: Please enable 'read_products' scope.")
-            
     return None
 
 def download_image(url: str):
@@ -178,7 +159,7 @@ def generate_pillow_image(order_data: dict):
     draw = ImageDraw.Draw(img)
 
     def get_font(size, bold=False):
-        fonts = ["/System/Library/Fonts/SFNS.ttf", "/Library/Fonts/Arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/freefont/FreeSans.ttf"]
+        fonts = ["/System/Library/Fonts/SFNS.ttf", "/Library/Fonts/Arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
         for p in fonts:
             if os.path.exists(p): return ImageFont.truetype(p, size)
         return ImageFont.load_default()
@@ -296,16 +277,20 @@ async def setup(request: Request):
     host = PUBLIC_HOST_URL or f"{request.headers.get('x-forwarded-proto', 'http')}://{request.headers.get('host')}"
     domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
     
-    # Register/Overwrite clean webhook
+    # Clean previous
     url = f"https://{domain}/admin/api/2024-04/webhooks.json"
     r = shopify_request(url, {"X-Shopify-Access-Token": token})
     for wh in r.json().get("webhooks", []):
         shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", {"X-Shopify-Access-Token": token}, method="DELETE")
     
+    results = []
     target = f"{host}/webhook/shopify"
-    payload = {"webhook": {"topic": "orders/paid", "address": target, "format": "json"}}
-    resp = shopify_request(url, {"X-Shopify-Access-Token": token}, method="POST", json=payload)
-    return {"message": f"Setup for {host}", "result": resp.json()}
+    for topic in ["orders/create", "orders/paid"]:
+        payload = {"webhook": {"topic": topic, "address": target, "format": "json"}}
+        resp = shopify_request(url, {"X-Shopify-Access-Token": token}, method="POST", json=payload)
+        results.append({topic: resp.status_code})
+    
+    return {"message": f"Setup for {host}", "details": results}
 
 @app.get("/cleanup")
 async def cleanup():
