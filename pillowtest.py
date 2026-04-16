@@ -139,7 +139,10 @@ def generate_pillow_image(order_data: dict, token: str):
             paths = [
                 "/System/Library/Fonts/SFNS.ttf",
                 "/System/Library/Fonts/Helvetica.ttc",
-                "/Library/Fonts/Arial.ttf"
+                "/Library/Fonts/Arial.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
             ]
             for p in paths:
                 if os.path.exists(p):
