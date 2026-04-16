@@ -57,7 +57,7 @@ def get_shopify_token(force_refresh=False):
         _cached_token = SHOPIFY_ACCESS_TOKEN
         return _cached_token
 
-    log(f"Refreshing token for {SHOP_DOMAIN}...")
+    log(f"Refreshing Shopify token for {SHOP_DOMAIN}...")
     url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
     payload = {"client_id": SHOPIFY_CLIENT_ID, "client_secret": SHOPIFY_CLIENT_SECRET, "grant_type": "client_credentials"}
     try:
@@ -65,8 +65,10 @@ def get_shopify_token(force_refresh=False):
         if resp.status_code == 200:
             token = resp.json().get("access_token")
             _cached_token = token
+            log("Token refreshed.")
             return token
-    except: pass
+    except Exception as e:
+        log(f"Token error: {e}")
     return _cached_token
 
 def shopify_request(url, headers, method="GET", json=None):
@@ -76,7 +78,7 @@ def shopify_request(url, headers, method="GET", json=None):
         else: resp = requests.post(url, headers=headers, json=json, timeout=15)
             
         if resp.status_code == 401:
-            log("401 Refreshing...")
+            log("401 Detected, refreshing token...")
             new_token = get_shopify_token(force_refresh=True)
             if new_token:
                 headers["X-Shopify-Access-Token"] = new_token
@@ -85,31 +87,43 @@ def shopify_request(url, headers, method="GET", json=None):
                 return requests.post(url, headers=headers, json=json, timeout=15)
         return resp
     except Exception as e:
-        return {"error_type": "NetworkException", "message": str(e)}
+        return {"error": str(e)}
 
 def fetch_product_image_url(product_id, variant_id):
     token = get_shopify_token()
     headers = {"X-Shopify-Access-Token": token}
+    
+    # 1. Try Variant (if there's a specific image for the option)
     if variant_id:
         url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/variants/{variant_id}.json"
         resp = shopify_request(url, headers)
         if isinstance(resp, requests.Response) and resp.status_code == 200:
             v = resp.json().get("variant", {})
-            return v.get("image_id") or v.get("src")
+            if v.get("src"): return v["src"] # Check if src is directly on variant
+    
+    # 2. Try Product images list
     if product_id:
         url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/products/{product_id}/images.json"
         resp = shopify_request(url, headers)
         if isinstance(resp, requests.Response) and resp.status_code == 200:
             imgs = resp.json().get("images", [])
-            if imgs: return imgs[0].get("src")
+            for img in imgs:
+                if img.get("src"): 
+                    log(f"Found product image URL: {img['src']}")
+                    return img["src"]
+        elif isinstance(resp, requests.Response) and resp.status_code == 403:
+            log("🚨 403 FORBIDDEN: App needs 'read_products' scope.")
+            
     return None
 
 def download_image(url):
     try:
+        log(f"Downloading image from: {url}")
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             return Image.open(BytesIO(resp.content)).convert("RGBA")
-    except: pass
+    except Exception as e:
+        log(f"Download failed: {e}")
     return None
 
 def generate_pillow_image(order_data):
@@ -122,13 +136,16 @@ def generate_pillow_image(order_data):
     
     items = order_data.get("line_items", [])
     processed_items = []
+    log(f"Generating image for Order #{order_id}")
+    
     for li in items[:4]:
         img_url = fetch_product_image_url(li.get("product_id"), li.get("variant_id"))
+        it_img = download_image(img_url) if img_url else None
         processed_items.append({
             "name": li.get("title", "Item"),
             "price": float(li.get("price", 0)),
             "qty": int(li.get("quantity", 1)),
-            "image": download_image(img_url) if img_url else None
+            "image": it_img
         })
 
     subtotal = float(order_data.get("current_subtotal_price", 0))
@@ -143,16 +160,9 @@ def generate_pillow_image(order_data):
     draw = ImageDraw.Draw(img)
 
     def get_font(size):
-        # Look for fonts in common Linux and Mac paths
-        paths = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-            "/System/Library/Fonts/SFNS.ttf",
-            "/Library/Fonts/Arial.ttf"
-        ]
+        paths = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/freefont/FreeSans.ttf", "/System/Library/Fonts/SFNS.ttf", "/Library/Fonts/Arial.ttf"]
         for p in paths:
             if os.path.exists(p): return ImageFont.truetype(p, size)
-        # Fallback to default if no TTF found
         return ImageFont.load_default()
 
     f_title, f_bold, f_regular = get_font(28*scale), get_font(20*scale), get_font(16*scale)
@@ -180,6 +190,7 @@ def generate_pillow_image(order_data):
             mask = Image.new("L", (sz, sz), 0)
             ImageDraw.Draw(mask).rounded_rectangle((0, 0, sz, sz), 20, fill=255)
             img.paste(it_img, (pad*2, curr_y), mask)
+            draw.rounded_rectangle((pad*2, curr_y, pad*2+sz, curr_y+sz), 20, outline=BORDER, width=2)
         else:
             draw.rounded_rectangle((pad*2, curr_y, pad*2+sz, curr_y+sz), 20, fill=BORDER)
         
@@ -210,6 +221,7 @@ def generate_pillow_image(order_data):
 
     out = os.path.join(os.path.dirname(__file__), f"order_{order_id}.png")
     img.save(out, dpi=(300, 300))
+    log(f"Generated order image: {out}")
     return out
 
 async def process_order(data):
@@ -232,7 +244,7 @@ async def process_order(data):
                 payload = {"messaging_product": "whatsapp", "to": p, "type": "template", "template": {"name": TEMPLATE_NAME, "language": {"code": LANG_CODE}, "components": [{"type": "header", "parameters": [{"type": "image", "image": {"id": mid}}]}]}}
                 requests.post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", headers=headers, json=payload)
         if os.path.exists(path): os.remove(path)
-    except Exception as e: log(f"Process Error: {e}")
+    except Exception as e: log(f"Process error: {e}")
 
 @app.post("/webhook/orders")
 async def webhook(request: Request, background_tasks: BackgroundTasks, x_shopify_hmac_sha256: str = Header(None)):
@@ -252,10 +264,13 @@ async def setup(request: Request):
     host = PUBLIC_HOST_URL or f"{request.headers.get('x-forwarded-proto', 'http')}://{request.headers.get('host')}"
     url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/webhooks.json"
     headers = {"X-Shopify-Access-Token": token}
+    
+    # Simple cleanup
     r = shopify_request(url, headers)
     if isinstance(r, requests.Response) and r.status_code == 200:
         for wh in r.json().get("webhooks", []):
             shopify_request(f"https://{SHOP_DOMAIN}/admin/api/2024-04/webhooks/{wh['id']}.json", headers, method="DELETE")
+    
     results = []
     target = f"{host}/webhook/orders"
     for topic in ["orders/create", "orders/paid"]:
@@ -263,20 +278,8 @@ async def setup(request: Request):
         if isinstance(resp, requests.Response):
             results.append({"topic": topic, "status": resp.status_code, "msg": resp.text if resp.status_code >= 400 else "OK"})
         else:
-            results.append({"topic": topic, "status": "NetworkError", "msg": resp.get("message")})
+            results.append({"topic": topic, "status": "Error", "msg": str(resp)})
     return {"message": f"Setup for {host}", "details": results}
-
-@app.get("/cleanup")
-async def cleanup():
-    token = get_shopify_token()
-    url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/webhooks.json"
-    r = shopify_request(url, {"X-Shopify-Access-Token": token})
-    count = 0
-    if isinstance(r, requests.Response) and r.status_code == 200:
-        for wh in r.json().get("webhooks", []):
-            shopify_request(f"https://{SHOP_DOMAIN}/admin/api/2024-04/webhooks/{wh['id']}.json", {"X-Shopify-Access-Token": token}, method="DELETE")
-            count += 1
-    return {"message": "Cleanup complete", "count": count}
 
 @app.get("/")
 def health(): return {"status": "ok", "shop": SHOP_DOMAIN}
