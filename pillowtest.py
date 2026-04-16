@@ -20,7 +20,10 @@ app = FastAPI()
 # ---------- CONFIGURATION ----------
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID")
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET")
-SHOP_DOMAIN = os.getenv("SHOP_DOMAIN")
+# Sanitize SHOP_DOMAIN: remove https:// and trailing slashes
+raw_domain = os.getenv("SHOP_DOMAIN", "")
+SHOP_DOMAIN = raw_domain.replace("https://", "").replace("http://", "").split("/")[0]
+
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 
 PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "996819796855984")
@@ -55,7 +58,7 @@ def get_shopify_token(force_refresh=False):
         _cached_token = SHOPIFY_ACCESS_TOKEN
         return _cached_token
 
-    log("Refreshing Shopify token...")
+    log(f"Refreshing Shopify token for {SHOP_DOMAIN}...")
     url = f"https://{SHOP_DOMAIN}/admin/oauth/access_token"
     payload = {"client_id": SHOPIFY_CLIENT_ID, "client_secret": SHOPIFY_CLIENT_SECRET, "grant_type": "client_credentials"}
     try:
@@ -65,43 +68,45 @@ def get_shopify_token(force_refresh=False):
             _cached_token = token
             log("Token refreshed successfully.")
             return token
-    except: pass
+        else:
+            log(f"Auth Failed: {resp.status_code} {resp.text}")
+    except Exception as e:
+        log(f"Auth Exception: {e}")
     return _cached_token
 
 def shopify_request(url, headers, method="GET", json=None):
     try:
-        if method == "GET": resp = requests.get(url, headers=headers, timeout=10)
-        elif method == "DELETE": resp = requests.delete(url, headers=headers, timeout=10)
-        else: resp = requests.post(url, headers=headers, json=json, timeout=10)
+        if method == "GET": resp = requests.get(url, headers=headers, timeout=15)
+        elif method == "DELETE": resp = requests.delete(url, headers=headers, timeout=15)
+        else: resp = requests.post(url, headers=headers, json=json, timeout=15)
             
         if resp.status_code == 401:
             log("401 detected, refreshing token...")
             new_token = get_shopify_token(force_refresh=True)
             if new_token:
                 headers["X-Shopify-Access-Token"] = new_token
-                if method == "GET": return requests.get(url, headers=headers, timeout=10)
-                if method == "DELETE": return requests.delete(url, headers=headers, timeout=10)
-                return requests.post(url, headers=headers, json=json, timeout=10)
+                if method == "GET": return requests.get(url, headers=headers, timeout=15)
+                if method == "DELETE": return requests.delete(url, headers=headers, timeout=15)
+                return requests.post(url, headers=headers, json=json, timeout=15)
         return resp
-    except: return None
+    except Exception as e:
+        return {"error_type": "NetworkException", "message": str(e)}
 
 def fetch_product_image_url(product_id, variant_id):
     token = get_shopify_token()
-    domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
     headers = {"X-Shopify-Access-Token": token}
     
     if variant_id:
-        url = f"https://{domain}/admin/api/2024-04/variants/{variant_id}.json"
+        url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/variants/{variant_id}.json"
         resp = shopify_request(url, headers)
-        if resp and resp.status_code == 200:
+        if isinstance(resp, requests.Response) and resp.status_code == 200:
             v = resp.json().get("variant", {})
-            img = v.get("image_id") or v.get("src")
-            if img: return img
+            return v.get("image_id") or v.get("src")
 
     if product_id:
-        url = f"https://{domain}/admin/api/2024-04/products/{product_id}/images.json"
+        url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/products/{product_id}/images.json"
         resp = shopify_request(url, headers)
-        if resp and resp.status_code == 200:
+        if isinstance(resp, requests.Response) and resp.status_code == 200:
             imgs = resp.json().get("images", [])
             if imgs: return imgs[0].get("src")
     return None
@@ -144,13 +149,13 @@ def generate_pillow_image(order_data):
     img = Image.new("RGB", (W, H), BG)
     draw = ImageDraw.Draw(img)
 
-    def get_font(size, bold=False):
+    def get_font(size):
         fonts = ["/System/Library/Fonts/SFNS.ttf", "/Library/Fonts/Arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
         for p in fonts:
             if os.path.exists(p): return ImageFont.truetype(p, size)
         return ImageFont.load_default()
 
-    f_title, f_bold, f_regular = get_font(28*scale, True), get_font(20*scale, True), get_font(16*scale)
+    f_title, f_bold, f_regular = get_font(28*scale), get_font(20*scale), get_font(16*scale)
 
     def draw_card(x, y, w, h, r=35):
         shadow = Image.new("RGBA", (w+60, h+60), (0,0,0,0))
@@ -175,7 +180,6 @@ def generate_pillow_image(order_data):
             mask = Image.new("L", (sz, sz), 0)
             ImageDraw.Draw(mask).rounded_rectangle((0, 0, sz, sz), 20, fill=255)
             img.paste(it_img, (pad*2, curr_y), mask)
-            draw.rounded_rectangle((pad*2, curr_y, pad*2+sz, curr_y+sz), 20, outline=BORDER, width=2)
         else:
             draw.rounded_rectangle((pad*2, curr_y, pad*2+sz, curr_y+sz), 20, fill=BORDER)
         
@@ -208,37 +212,27 @@ def generate_pillow_image(order_data):
     img.save(out, dpi=(300, 300))
     return out
 
-def upload_media(path):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    try:
-        with open(path, "rb") as f:
-            r = requests.post(url, headers=headers, files={"file": (os.path.basename(path), f, "image/png"), "type": (None, "image/png"), "messaging_product": (None, "whatsapp")})
-            return r.json().get("id")
-    except: return None
-
-def send_whatsapp(to, media_id):
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    payload = {"messaging_product": "whatsapp", "to": to, "type": "template", "template": {"name": TEMPLATE_NAME, "language": {"code": LANG_CODE}, "components": [{"type": "header", "parameters": [{"type": "image", "image": {"id": media_id}}]}]}}
-    return requests.post(url, headers=headers, json=payload).json()
-
 async def process_order(data):
     order_id = data.get("id")
     if order_id in _processed_orders: return
     _processed_orders.add(order_id)
     try:
         path = generate_pillow_image(data)
-        mid = upload_media(path)
+        url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        with open(path, "rb") as f:
+            r = requests.post(url, headers=headers, files={"file": (os.path.basename(path), f, "image/png"), "type": (None, "image/png"), "messaging_product": (None, "whatsapp")})
+            mid = r.json().get("id")
         if mid:
             cust = data.get("customer") or {}
             phone = cust.get("phone") or cust.get("default_address", {}).get("phone")
             if phone:
                 p = "".join(filter(str.isdigit, phone))
                 if len(p) == 10: p = "91" + p
-                send_whatsapp(p, mid)
+                payload = {"messaging_product": "whatsapp", "to": p, "type": "template", "template": {"name": TEMPLATE_NAME, "language": {"code": LANG_CODE}, "components": [{"type": "header", "parameters": [{"type": "image", "image": {"id": mid}}]}]}}
+                requests.post(f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages", headers=headers, json=payload)
         if os.path.exists(path): os.remove(path)
-    except: pass
+    except Exception as e: log(f"Process Error: {e}")
 
 @app.post("/webhook/orders")
 async def webhook(request: Request, background_tasks: BackgroundTasks, x_shopify_hmac_sha256: str = Header(None)):
@@ -256,45 +250,41 @@ async def webhook(request: Request, background_tasks: BackgroundTasks, x_shopify
 async def setup(request: Request):
     token = get_shopify_token()
     host = PUBLIC_HOST_URL or f"{request.headers.get('x-forwarded-proto', 'http')}://{request.headers.get('host')}"
-    domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
-    url = f"https://{domain}/admin/api/2024-04/webhooks.json"
+    url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/webhooks.json"
     headers = {"X-Shopify-Access-Token": token}
     
-    # 1. Vigorous Cleanup
-    try:
-        r = shopify_request(url, headers)
-        if r and r.status_code == 200:
-            for wh in r.json().get("webhooks", []):
-                shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", headers, method="DELETE")
-    except: pass
+    # Clean up
+    r = shopify_request(url, headers)
+    if isinstance(r, requests.Response) and r.status_code == 200:
+        for wh in r.json().get("webhooks", []):
+            shopify_request(f"https://{SHOP_DOMAIN}/admin/api/2024-04/webhooks/{wh['id']}.json", headers, method="DELETE")
     
-    # 2. Re-register
+    # Register
     results = []
     target = f"{host}/webhook/orders"
     for topic in ["orders/create", "orders/paid"]:
-        payload = {"webhook": {"topic": topic, "address": target, "format": "json"}}
-        resp = shopify_request(url, headers, method="POST", json=payload)
-        status = resp.status_code if resp else "Failed"
-        error = resp.text if resp and resp.status_code >= 400 else None
-        results.append({"topic": topic, "status": status, "error": error})
-        
-    return {"message": f"Setup for {host}", "details": results}
+        resp = shopify_request(url, headers, method="POST", json={"webhook": {"topic": topic, "address": target, "format": "json"}})
+        if isinstance(resp, requests.Response):
+            results.append({"topic": topic, "status": resp.status_code, "msg": resp.text if resp.status_code >= 400 else "OK"})
+        else:
+            results.append({"topic": topic, "status": "NetworkError", "msg": resp.get("message")})
+            
+    return {"message": f"Setup for {host}", "domain_used": SHOP_DOMAIN, "details": results}
 
 @app.get("/cleanup")
 async def cleanup():
     token = get_shopify_token()
-    domain = SHOP_DOMAIN if SHOP_DOMAIN.endswith(".myshopify.com") else f"{SHOP_DOMAIN}.myshopify.com"
-    url = f"https://{domain}/admin/api/2024-04/webhooks.json"
+    url = f"https://{SHOP_DOMAIN}/admin/api/2024-04/webhooks.json"
     r = shopify_request(url, {"X-Shopify-Access-Token": token})
     count = 0
-    if r and r.status_code == 200:
+    if isinstance(r, requests.Response) and r.status_code == 200:
         for wh in r.json().get("webhooks", []):
-            shopify_request(f"https://{domain}/admin/api/2024-04/webhooks/{wh['id']}.json", {"X-Shopify-Access-Token": token}, method="DELETE")
+            shopify_request(f"https://{SHOP_DOMAIN}/admin/api/2024-04/webhooks/{wh['id']}.json", {"X-Shopify-Access-Token": token}, method="DELETE")
             count += 1
     return {"message": "Cleanup complete", "deleted_count": count}
 
 @app.get("/")
-def health(): return {"status": "ok", "token": get_shopify_token() is not None}
+def health(): return {"status": "ok", "shop": SHOP_DOMAIN, "token_check": get_shopify_token() is not None}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5002)
