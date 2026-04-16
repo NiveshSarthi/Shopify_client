@@ -1,1 +1,0 @@
-# Shopify_client
