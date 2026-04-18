@@ -735,6 +735,13 @@ def generate_pillow_image(order_data: dict) -> str | None:
             summary_line_y,
             bold=True,
         )
+        summary_line_y = draw_summary_row(
+            "Paid Amount",
+            paid,
+            summary_line_y,
+            bold=True,
+            value_color="#006328",
+        )
         draw_summary_row(
             "Balance Due",
             total - paid,
@@ -869,31 +876,38 @@ async def process_order_sequence_v2(data: dict) -> None:
         else:
             log(f"Second template sent for order_id={order_id}", level="info")
 
-        log("Sleeping 1s before third template", level="debug")
-        await asyncio.sleep(1)
-
-        total = float(data.get("current_total_price", 0))
-        _rounded_order, token_amount, payment_link = get_payment_data(total)
-        third_vars = [f"{total:.2f}", int(token_amount), payment_link]
-        log(
-            "Sending third template "
-            f"order_id={order_id} exact_total={total:.2f} token={token_amount}",
-            level="info",
-        )
-        third_result = await loop.run_in_executor(
-            None,
-            send_external_template,
-            phone,
-            TEMPLATE_THIRD,
-            third_vars,
-        )
-        if isinstance(third_result, dict) and third_result.get("error"):
+        financial_status = str(data.get("financial_status", "")).strip().lower()
+        if financial_status == "paid":
             log(
-                f"Third template failed for order_id={order_id}: {third_result}",
-                level="error",
+                f"Skipping third template for paid order_id={order_id}",
+                level="info",
             )
         else:
-            log(f"Third template sent for order_id={order_id}", level="info")
+            log("Sleeping 1s before third template", level="debug")
+            await asyncio.sleep(1)
+
+            total = float(data.get("current_total_price", 0))
+            _rounded_order, token_amount, payment_link = get_payment_data(total)
+            third_vars = [f"{total:.2f}", int(token_amount), payment_link]
+            log(
+                "Sending third template "
+                f"order_id={order_id} exact_total={total:.2f} token={token_amount}",
+                level="info",
+            )
+            third_result = await loop.run_in_executor(
+                None,
+                send_external_template,
+                phone,
+                TEMPLATE_THIRD,
+                third_vars,
+            )
+            if isinstance(third_result, dict) and third_result.get("error"):
+                log(
+                    f"Third template failed for order_id={order_id}: {third_result}",
+                    level="error",
+                )
+            else:
+                log(f"Third template sent for order_id={order_id}", level="info")
 
         log(
             f"Order sequence completed order_id={order_id} image_file={filename}",
