@@ -261,15 +261,23 @@ def send_external_template(
 # ---------- IMAGE GENERATION ----------
 def get_font(size: int, bold: bool = False):
     log(f"Resolving font size={size} bold={bold}", level="debug")
-    paths = [
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
-        if bold
-        else "/usr/share/fonts/truetype/liberation/LiberationSans.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
-        if bold
-        else "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
-    ]
+    if bold:
+        paths = [
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+        ]
+    else:
+        paths = [
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ]
     for path in paths:
         if os.path.exists(path):
             try:
@@ -865,11 +873,11 @@ async def process_order_sequence_v2(data: dict) -> None:
         await asyncio.sleep(1)
 
         total = float(data.get("current_total_price", 0))
-        rounded_order, token_amount, payment_link = get_payment_data(total)
-        third_vars = [int(rounded_order), int(token_amount), payment_link]
+        _rounded_order, token_amount, payment_link = get_payment_data(total)
+        third_vars = [f"{total:.2f}", int(token_amount), payment_link]
         log(
             "Sending third template "
-            f"order_id={order_id} rounded={rounded_order} token={token_amount}",
+            f"order_id={order_id} exact_total={total:.2f} token={token_amount}",
             level="info",
         )
         third_result = await loop.run_in_executor(
