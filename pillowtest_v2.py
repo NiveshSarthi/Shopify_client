@@ -7,8 +7,9 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
+from threading import Lock
 
 import requests
 import uvicorn
@@ -64,6 +65,8 @@ IMAGE_OUTPUT_DIR = os.path.join(
 
 _cached_token = None
 _processed_orders: set[int | str | None] = set()
+_processed_orders_lock = Lock()
+SERVER_START_TIME_UTC = datetime.now(timezone.utc)
 
 
 # ---------- LOGGING ----------
@@ -96,6 +99,49 @@ def mask_phone(phone: str | None) -> str:
     return f"{clean[:2]}******{clean[-2:]}"
 
 
+def try_mark_order_processed(order_id: int | str | None) -> bool:
+    if order_id is None:
+        return True
+    with _processed_orders_lock:
+        if order_id in _processed_orders:
+            return False
+        _processed_orders.add(order_id)
+        return True
+
+
+def parse_shopify_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def resolve_webhook_event_time(payload: dict, request: Request) -> datetime | None:
+    candidates = [
+        ("x-shopify-triggered-at", request.headers.get("x-shopify-triggered-at")),
+        ("processed_at", payload.get("processed_at")),
+        ("updated_at", payload.get("updated_at")),
+        ("created_at", payload.get("created_at")),
+    ]
+
+    for source, raw_value in candidates:
+        parsed = parse_shopify_datetime(str(raw_value)) if raw_value else None
+        if parsed:
+            log(
+                f"Resolved event time source={source} value={parsed.isoformat()}",
+                level="debug",
+            )
+            return parsed
+
+    log("Could not resolve webhook event time from header/payload", level="warning")
+    return None
+
+
 def ensure_image_output_dir() -> str:
     os.makedirs(IMAGE_OUTPUT_DIR, exist_ok=True)
     return IMAGE_OUTPUT_DIR
@@ -113,7 +159,8 @@ log(
     f"shop_domain={SHOP_DOMAIN or 'N/A'} "
     f"public_host_configured={bool(PUBLIC_HOST_URL)} "
     f"external_api_configured={bool(EXTERNAL_API_URL and EXTERNAL_API_TOKEN)} "
-    f"image_output_dir={IMAGE_OUTPUT_DIR}",
+    f"image_output_dir={IMAGE_OUTPUT_DIR} "
+    f"server_start_utc={SERVER_START_TIME_UTC.isoformat()}",
     level="info",
 )
 
@@ -766,12 +813,6 @@ def generate_pillow_image(order_data: dict) -> str | None:
 async def process_order_sequence_v2(data: dict) -> None:
     order_id = data.get("id")
     log(f"Starting order sequence for order_id={order_id}", level="info")
-    if order_id in _processed_orders:
-        log(f"Skipping duplicate order_id={order_id}", level="warning")
-        return
-
-    _processed_orders.add(order_id)
-    log(f"Order marked as processed order_id={order_id}", level="debug")
 
     try:
         customer = data.get("customer") or {}
@@ -939,7 +980,23 @@ async def webhook(
         log(f"Failed to parse webhook JSON: {exc}", level="error")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    log(f"Queueing background sequence for order_id={payload.get('id')}", level="info")
+    order_id = payload.get("id")
+    event_time = resolve_webhook_event_time(payload, request)
+    if event_time and event_time < SERVER_START_TIME_UTC:
+        log(
+            "Ignoring old webhook event "
+            f"order_id={order_id} event_time={event_time.isoformat()} "
+            f"server_start={SERVER_START_TIME_UTC.isoformat()}",
+            level="info",
+        )
+        return {"ok": True, "ignored": "old_event"}
+
+    if not try_mark_order_processed(order_id):
+        log(f"Ignoring duplicate webhook order_id={order_id}", level="info")
+        return {"ok": True, "ignored": "duplicate_order_id"}
+
+    log(f"Order marked as processed order_id={order_id}", level="debug")
+    log(f"Queueing background sequence for order_id={order_id}", level="info")
     background_tasks.add_task(process_order_sequence_v2, payload)
     return {"ok": True}
 
