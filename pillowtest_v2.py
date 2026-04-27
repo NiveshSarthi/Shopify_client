@@ -121,6 +121,32 @@ def parse_shopify_datetime(value: str | None) -> datetime | None:
         return None
 
 
+def is_cod_order(order_data: dict) -> bool:
+    gateway_values: list[str] = []
+
+    gateway_names = order_data.get("payment_gateway_names")
+    if isinstance(gateway_names, list):
+        gateway_values.extend(str(name) for name in gateway_names if name)
+    elif gateway_names:
+        gateway_values.append(str(gateway_names))
+
+    gateway = order_data.get("gateway")
+    if gateway:
+        gateway_values.append(str(gateway))
+
+    for gateway_value in gateway_values:
+        normalized = gateway_value.lower().replace("-", " ").replace("_", " ").strip()
+        normalized = " ".join(normalized.split())
+        if (
+            "cash on delivery" in normalized
+            or normalized == "cashondelivery"
+            or "cod" in normalized.split()
+        ):
+            return True
+
+    return False
+
+
 def resolve_webhook_event_time(payload: dict, request: Request) -> datetime | None:
     candidates = [
         ("x-shopify-triggered-at", request.headers.get("x-shopify-triggered-at")),
@@ -918,9 +944,16 @@ async def process_order_sequence_v2(data: dict) -> None:
             log(f"Second template sent for order_id={order_id}", level="info")
 
         financial_status = str(data.get("financial_status", "")).strip().lower()
+        cod_order = is_cod_order(data)
         if financial_status == "paid":
             log(
                 f"Skipping third template for paid order_id={order_id}",
+                level="info",
+            )
+        elif not cod_order:
+            log(
+                "Skipping third template for non-COD unpaid order "
+                f"order_id={order_id} financial_status={financial_status or 'N/A'}",
                 level="info",
             )
         else:
@@ -982,7 +1015,14 @@ async def webhook(
 
     order_id = payload.get("id")
     event_time = resolve_webhook_event_time(payload, request)
-    if event_time and event_time < SERVER_START_TIME_UTC:
+    if not event_time:
+        log(
+            f"Ignoring webhook with unresolved event time order_id={order_id}",
+            level="warning",
+        )
+        return {"ok": True, "ignored": "missing_event_time"}
+
+    if event_time < SERVER_START_TIME_UTC:
         log(
             "Ignoring old webhook event "
             f"order_id={order_id} event_time={event_time.isoformat()} "
