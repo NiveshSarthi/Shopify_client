@@ -845,14 +845,28 @@ async def process_order_sequence_v2(data: dict) -> None:
         shipping_address = data.get("shipping_address") or {}
         billing_address = data.get("billing_address") or {}
 
-        raw_phone = (
-            customer.get("phone")
-            or shipping_address.get("phone")
-            or billing_address.get("phone")
-            or ""
-        )
-        phone = "".join(filter(str.isdigit, str(raw_phone)))[-10:]
-        phone = f"91{phone}" if phone else ""
+        phone = ""
+        phone_candidates: list[tuple[str, str | None]] = [
+            ("shipping_address.phone", shipping_address.get("phone")),
+            ("billing_address.phone", billing_address.get("phone")),
+            ("customer.phone", customer.get("phone")),
+        ]
+        for source, raw_phone in phone_candidates:
+            normalized = "".join(filter(str.isdigit, str(raw_phone or "")))[-10:]
+            candidate_phone = f"91{normalized}" if normalized else ""
+            if len(candidate_phone) >= 12:
+                phone = candidate_phone
+                log(
+                    f"Using phone source={source} for order_id={order_id}",
+                    level="debug",
+                )
+                break
+            if raw_phone:
+                log(
+                    f"Ignoring invalid phone source={source} order_id={order_id}",
+                    level="warning",
+                )
+
         if len(phone) < 12:
             log(f"Phone validation failed for order_id={order_id}", level="warning")
             return
